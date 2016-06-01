@@ -1,0 +1,177 @@
+package tachyon.JXIO;
+
+import com.mellanox.jxio.*;
+import com.mellanox.jxio.exceptions.JxioGeneralException;
+import com.mellanox.jxio.exceptions.JxioQueueOverflowException;
+import com.mellanox.jxio.exceptions.JxioSessionClosedException;
+import org.apache.log4j.Logger;
+import tachyon.Constants;
+
+import tachyon.worker.DataServerMessage;
+
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
+
+/**
+ * Created by yuyang on 2014/10/8.
+ */
+public class xio_RemoteBlockInStreamClient {
+
+    private int BufferSize;        //构造函数初始化的时候传入BufferSize的大小
+    private final Logger LOG = Logger.getLogger(Constants.LOGGER_TYPE);
+
+    private MsgPool mp;                       //定义一个MsgPool用于收发消息和数据
+    private EventQueueHandler eqh;            //用于处理消息回调
+    private ClientSession RemoteBLockInStreamClientSession;//由于这个类作为请求访问block的客户端，因此这个类应该建立ClientSession
+
+    private ByteBuffer mRecvResponseFromDataServer;                //接收到的消息
+    private volatile boolean IsRecvResponseFromDataServer;  //用来标志是否已经接收到数据了,注意这个不反应消息的完整性
+
+    /**
+     * RemoteBlockInStreamClient的构造器
+     * @param BufferSize
+     */
+    public xio_RemoteBlockInStreamClient(int BufferSize){
+        this.BufferSize = BufferSize;
+        this.mp = new MsgPool(256,xio_DataServerMessage.HEADER_LENGTH+UserConf.get().REMOTE_READ_BUFFER_SIZE_BYTE,xio_DataServerMessage.HEADER_LENGTH);
+        this.eqh = new EventQueueHandler(null);
+        mRecvResponseFromDataServer = null;                //接收到的消息
+        IsRecvResponseFromDataServer = false;
+    }
+
+
+    private synchronized boolean setRecvResponseFromDataServer(ByteBuffer RecvData){
+        mRecvResponseFromDataServer = null;
+        try{
+            mRecvResponseFromDataServer = ByteBuffer.allocate(RecvData.capacity());
+        }catch (IllegalArgumentException e){
+
+            e.printStackTrace();
+            return false;
+        }
+
+        mRecvResponseFromDataServer.clear();
+        mRecvResponseFromDataServer.put(RecvData);
+        mRecvResponseFromDataServer.flip();
+
+        return true;
+    }
+
+    private synchronized void SetIsRecvData(boolean IsRecvData){
+        IsRecvResponseFromDataServer = IsRecvData;
+    }
+    private boolean IsRecvData() {
+        return IsRecvResponseFromDataServer;
+    }
+
+    /**
+     * ConnectDataServer:连接DataServer服务器的接口
+     * @param address
+     * @param blockId
+     * @param offset
+     * @param length
+     * @return
+     * 注意事项：由于该函数内部调用的SendRequest是异步的，因此，该函数返回true以后，也不意味着消息已经成功发送。
+     */
+    private boolean ConnectDataServer(InetSocketAddress address,long blockId,long offset,long length){
+        //现将InetSocketAddress转换成URI
+        URI uri;
+        try{
+            uri = new URI("rdma://" + address.getAddress().getHostAddress() + ":" + address.getPort() + "/");
+        }catch (URISyntaxException e)
+        {
+            e.printStackTrace();
+            return false;
+        }
+
+        this.RemoteBLockInStreamClientSession = new ClientSession(eqh,uri,new RemoteBlockInStreamCallbacks(this));
+
+        //封装一个请求包，这里调用DataServerMessage获得一个请求格式的包，然后对DataServerMessage进行解析以后，重新封装
+        DataServerMessage sendMsg = DataServerMessage.createBlockRequestMessage(blockId, offset, length);
+        //重新封装数据包
+        ByteBuffer xio_SendMsg = xio_DataServerMessage.CreateBlockRequestMessagePacket(sendMsg.getBlockId(), sendMsg.getOffset(), sendMsg.getLength(), sendMsg.getReadOnlyData(), -1);
+
+        //发送请求包
+        Msg msg = this.mp.getMsg();
+        msg.getOut().put(xio_SendMsg);
+
+        try {
+            RemoteBLockInStreamClientSession.sendRequest(msg);
+        }catch(JxioGeneralException e){
+
+            mp.releaseMsg(msg);
+            return false;
+        }catch(JxioSessionClosedException e){
+            mp.releaseMsg(msg);
+
+            return false;
+        }catch (JxioQueueOverflowException e){
+
+            mp.releaseMsg(msg);
+            return false;
+        }
+
+        return true;
+    }
+
+    public ByteBuffer ReadBlockFromRemoteMachine(InetSocketAddress address,long blockId){
+        return this.ReadBlockFromRemoteMachine(address,blockId,0,-1);
+    }
+    public ByteBuffer ReadBlockFromRemoteMachine(InetSocketAddress address,long blockId,long offset,long length){
+
+        if( !ConnectDataServer(address,blockId,offset,length) ){
+            return null;
+        }
+
+        eqh.run();
+
+        if(IsRecvData())
+        {
+            //把收到的消息包拆开，提取去Data部分返回
+            return xio_DataServerMessage.GetData(mRecvResponseFromDataServer);
+        }
+        else
+        {
+            return null;
+        }
+    }
+
+
+    /**
+     * 以下是ClientSession的回调接口的实现
+     */
+    class RemoteBlockInStreamCallbacks implements ClientSession.Callbacks{
+        private xio_RemoteBlockInStreamClient client;
+
+        RemoteBlockInStreamCallbacks(xio_RemoteBlockInStreamClient client){
+            this.client = client;
+        }
+
+        public void onSessionEstablished(){
+
+        }
+        public void onMsgError(Msg msg,EventReason reason){
+
+            msg.returnToParentPool();
+            client.RemoteBLockInStreamClientSession.close();
+            client.SetIsRecvData(false);
+        }
+
+        public void onResponse(Msg msg){
+
+            client.SetIsRecvData(client.setRecvResponseFromDataServer(msg.getIn()));     //表示已经接受到消息了
+            //接收完一次数据以后，就可以关闭会话了
+
+            client.RemoteBLockInStreamClientSession.close();
+        }
+
+        public void onSessionEvent(EventName event,EventReason reason){
+
+            if(event == EventName.SESSION_CLOSED){
+                client.eqh.stop();
+            }
+        }
+    }
+}

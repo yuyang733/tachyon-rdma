@@ -1,0 +1,4 @@
+{"type":"Version","parameters":{"version":2}}
+{"type":"InodeFolder","parameters":{"id":1,"parentId":-1,"pinned":false,"name":"","childrenIds":[],"creationTimeMs":1449094814341}}
+{"type":"RawTable","parameters":{"ids":[],"data":[],"columns":[]}}
+{"type":"Checkpoint","parameters":{"dependencyCounter":0,"editTransactionCounter":0,"inodeCounter":1}}
